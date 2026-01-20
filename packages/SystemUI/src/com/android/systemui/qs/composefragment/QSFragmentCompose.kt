@@ -17,6 +17,7 @@
 package com.android.systemui.qs.composefragment
 
 import android.annotation.SuppressLint
+import android.content.ContentResolver
 import android.content.Context
 import android.content.res.Configuration
 import android.database.ContentObserver
@@ -24,9 +25,12 @@ import android.graphics.Canvas
 import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.Rect
+import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
 import android.os.Trace
 import android.os.UserHandle
+import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
@@ -58,9 +62,9 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -120,6 +124,7 @@ import com.android.systemui.brightness.ui.compose.ContainerColors
 import com.android.systemui.compose.modifiers.sysUiResTagContainer
 import com.android.systemui.compose.modifiers.sysuiResTag
 import com.android.systemui.dagger.qualifiers.Background
+import com.android.systemui.dagger.qualifiers.Main
 import com.android.systemui.dump.DumpManager
 import com.android.systemui.initOnBackPressedDispatcherOwner
 import com.android.systemui.keyboard.shortcut.ui.composable.InteractionsConfig
@@ -181,7 +186,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
-import lineageos.providers.LineageSettings
 
 @SuppressLint("ValidFragment")
 class QSFragmentCompose
@@ -193,6 +197,7 @@ constructor(
     @Background private val backgroundDispatcher: CoroutineDispatcher,
     private val mediaLogger: MediaViewLogger,
     @ShadeDisplayAware private val configurationController: ConfigurationController,
+    @Main private val mainHandler: Handler,
 ) : LifecycleFragment(), QS, Dumpable {
 
     private val scrollListener = MutableStateFlow<QS.ScrollListener?>(null)
@@ -214,6 +219,23 @@ constructor(
     private val containerView: FrameLayoutTouchPassthrough?
         get() = view as? FrameLayoutTouchPassthrough
 
+    private lateinit var mSettingsObserver: ContentObserver
+    private lateinit var mContentResolver: ContentResolver
+    private var _sliderAtTop by mutableStateOf(true)
+    private var _showSlider by mutableStateOf(1)
+
+    var mSliderAtTop: Boolean
+        get() = _sliderAtTop
+        set(value) {
+            _sliderAtTop = value
+        }
+
+    var mShowSlider: Int
+        get() = _showSlider
+        set(value) {
+            _showSlider = value
+        }
+
     override fun onStart() {
         super.onStart()
         registerDumpable()
@@ -227,6 +249,31 @@ constructor(
 
         setListenerCollections()
         lifecycleScope.launch { viewModel.activate() }
+        
+        mContentResolver = getContext().getContentResolver()
+        mSliderAtTop = Settings.Secure.getIntForUser(
+            mContentResolver,
+            Settings.Secure.QS_BRIGHTNESS_POSITION_BOTTOM,
+            0,
+            UserHandle.USER_CURRENT
+        ) == 0
+
+        mShowSlider = Settings.Secure.getIntForUser(
+            mContentResolver,
+            Settings.Secure.QS_SHOW_BRIGHTNESS,
+            1,
+            UserHandle.USER_CURRENT
+        )
+        mSettingsObserver = object : ContentObserver(mainHandler) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                uri ?: return
+                val key = uri.lastPathSegment ?: return
+                handleSettingsChange(key)
+            }
+        }
+
+        registerObserver(Settings.Secure.QS_SHOW_BRIGHTNESS)
+        registerObserver(Settings.Secure.QS_BRIGHTNESS_POSITION_BOTTOM)
     }
 
     override fun onCreateView(
@@ -281,6 +328,40 @@ constructor(
             FrameLayout.LayoutParams.MATCH_PARENT,
         )
         return frame
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        mContentResolver.unregisterContentObserver(mSettingsObserver)
+    }
+
+    private fun handleSettingsChange(key: String) {
+        when (key) {
+            Settings.Secure.QS_SHOW_BRIGHTNESS -> {
+                mShowSlider = Settings.Secure.getIntForUser(
+                    mContentResolver,
+                    Settings.Secure.QS_SHOW_BRIGHTNESS,
+                    0,
+                    UserHandle.USER_CURRENT
+                )
+            }
+            Settings.Secure.QS_BRIGHTNESS_POSITION_BOTTOM -> {
+                mSliderAtTop = Settings.Secure.getIntForUser(
+                    mContentResolver,
+                    Settings.Secure.QS_BRIGHTNESS_POSITION_BOTTOM,
+                    0,
+                    UserHandle.USER_CURRENT
+                ) == 0
+            }
+        }
+    }
+
+    private fun registerObserver(key: String) {
+        mContentResolver.registerContentObserver(
+            Settings.Secure.getUriFor(key),
+            false,
+            mSettingsObserver
+        )
     }
 
     @Composable
@@ -804,11 +885,13 @@ constructor(
                                 )
                                 .padding(horizontal = qsHorizontalMargin())
                     ) {
-                        QuickQuickSettingsLayout(
+                        QuickQuickSettingsLayout (
                             brightness = BrightnessSlider,
                             tiles = Tiles,
                             media = Media,
                             mediaInRow = viewModel.qqsMediaInRow,
+                            showSlider = mShowSlider,
+                            sliderAtTop = mSliderAtTop,
                         )
                     }
                 }
@@ -938,6 +1021,8 @@ constructor(
                                 tiles = TileGrid,
                                 media = Media,
                                 mediaInRow = viewModel.qsMediaInRow,
+                                showSlider = mShowSlider,
+                                sliderAtTop = mSliderAtTop,
                             )
                         }
                     }
@@ -990,6 +1075,7 @@ constructor(
             }
         }
     }
+
 
     @Composable
     private fun EditModeElement(modifier: Modifier = Modifier) {
@@ -1484,11 +1570,9 @@ fun QuickQuickSettingsLayout(
     tiles: @Composable () -> Unit,
     media: @Composable () -> Unit,
     mediaInRow: Boolean,
+    showSlider: Int,
+    sliderAtTop: Boolean,
 ) {
-    val brightnessSettings = rememberQsBrightnessSettings()
-    val sliderAtTop = brightnessSettings.sliderAtTop
-    val showSlider = brightnessSettings.showSlider
-
     Column(verticalArrangement = spacedBy(dimensionResource(R.dimen.qs_tile_margin_vertical))) {
         if (showSlider == 2 && sliderAtTop) {
             brightness()
@@ -1504,14 +1588,11 @@ fun QuickQuickSettingsLayout(
             }
         } else {
             tiles()
+            media()
         }
 
         if (showSlider == 2 && !sliderAtTop) {
             brightness()
-        }
-
-        if (!mediaInRow) {
-            media()
         }
     }
 }
@@ -1524,11 +1605,9 @@ fun QuickSettingsLayout(
     tiles: @Composable () -> Unit,
     media: @Composable () -> Unit,
     mediaInRow: Boolean,
+    showSlider: Int,
+    sliderAtTop: Boolean,
 ) {
-    val brightnessSettings = rememberQsBrightnessSettings()
-    val sliderAtTop = brightnessSettings.sliderAtTop
-    val showSlider = brightnessSettings.showSlider
-
     Column(
         verticalArrangement = spacedBy(dimensionResource(R.dimen.qs_tile_margin_vertical)),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -1545,15 +1624,14 @@ fun QuickSettingsLayout(
                 Box(modifier = Modifier.weight(1f)) { tiles() }
                 Box(modifier = Modifier.weight(1f)) { media() }
             }
+            if (showSlider != 0 && !sliderAtTop) {
+                brightness()
+            }
         } else {
             tiles()
-        }
-
-        if (showSlider != 0 && !sliderAtTop) {
-            brightness()
-        }
-
-        if (!mediaInRow) {
+            if (showSlider != 0 && !sliderAtTop) {
+                brightness()
+            }
             media()
         }
     }
@@ -1606,64 +1684,3 @@ private fun AlwaysDarkMode(content: @Composable () -> Unit) {
         }
     }
 }
-
-@Composable
-private fun rememberQsBrightnessSettings(): QsBrightnessSettings {
-    val context = LocalContext.current
-    val cr = remember { context.contentResolver }
-
-    fun readCurrent(): QsBrightnessSettings {
-        val position = runCatching {
-            LineageSettings.Secure.getIntForUser(
-                cr, LineageSettings.Secure.QS_BRIGHTNESS_SLIDER_POSITION,
-                0, UserHandle.USER_CURRENT
-            )
-        }.getOrElse { 0 }
-
-        val showSliderValue = runCatching {
-            LineageSettings.Secure.getIntForUser(
-                cr, LineageSettings.Secure.QS_SHOW_BRIGHTNESS_SLIDER,
-                1, UserHandle.USER_CURRENT
-            )
-        }.getOrElse { 1 }
-
-        return QsBrightnessSettings(
-            sliderAtTop = position == 0,
-            showSlider = showSliderValue,
-        )
-    }
-
-    var state by remember {
-        mutableStateOf(readCurrent())
-    }
-
-    DisposableEffect(Unit) {
-        val observer = object : ContentObserver(null) {
-            override fun onChange(selfChange: Boolean) {
-                context.mainExecutor.execute {
-                    state = readCurrent()
-                }
-            }
-        }
-
-        cr.registerContentObserver(
-            LineageSettings.Secure.getUriFor(LineageSettings.Secure.QS_BRIGHTNESS_SLIDER_POSITION),
-            false, observer, UserHandle.USER_ALL
-        )
-        cr.registerContentObserver(
-            LineageSettings.Secure.getUriFor(LineageSettings.Secure.QS_SHOW_BRIGHTNESS_SLIDER),
-            false, observer, UserHandle.USER_ALL
-        )
-
-        onDispose {
-            cr.unregisterContentObserver(observer)
-        }
-    }
-
-    return state
-}
-
-private data class QsBrightnessSettings(
-    val sliderAtTop: Boolean,
-    val showSlider: Int,
-)
